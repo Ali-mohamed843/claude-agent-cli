@@ -17,7 +17,7 @@ MAX_FILE_BYTES = 200_000
 MAX_OUTPUT_CHARS = 20_000
 MAX_SEARCH_MATCHES = 100
 COMMAND_TIMEOUT_SECONDS = 60
-SKIPPED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
+SKIPPED_DIRS = {".agent-receipts", ".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
 
 TOOL_DEFINITIONS: list[BetaToolParam] = [
     {

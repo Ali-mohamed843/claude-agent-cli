@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import platform
 import sys
+import time
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
 import anthropic
 from anthropic.types.beta import BetaContentBlock, BetaMessage, BetaMessageParam, BetaToolResultBlockParam
 
 from .cost import Usage
+from .recorder import Recorder, content_summary
 from .tools import TOOL_DEFINITIONS, ToolBox, ToolError, truncate
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -54,12 +57,14 @@ class Agent:
         model: str = DEFAULT_MODEL,
         effort: str = "high",
         write: Callable[[str], object] = sys.stdout.write,
+        recorder: Recorder | None = None,
     ) -> None:
         self.client = client
         self.toolbox = toolbox
         self.model = model
         self.effort = effort
         self.write = write
+        self.recorder = recorder
         self.system = build_system_prompt(toolbox)
         self.messages: list[BetaMessageParam] = []
         self.session_usage = Usage()
@@ -68,6 +73,11 @@ class Agent:
     def reset(self) -> None:
         """Start a new conversation."""
         self.messages = []
+        self._record("reset")
+
+    def _record(self, type: str, **fields: Any) -> None:
+        if self.recorder:
+            self.recorder.event(type, **fields)
 
     def send(self, user_text: str) -> Usage:
         """Run one user turn to completion. Returns the tokens it used.
@@ -78,6 +88,7 @@ class Agent:
         start = len(self.messages)
         turn_usage = Usage()
         self.messages.append({"role": "user", "content": user_text})
+        self._record("user_message", text=user_text)
         try:
             while True:
                 response = self._stream_response()
@@ -85,6 +96,12 @@ class Agent:
                 turn_usage += usage
                 self.session_usage += usage
                 self.messages.append({"role": "assistant", "content": response.content})
+                self._record(
+                    "model_response",
+                    stop_reason=response.stop_reason,
+                    usage=asdict(usage),
+                    content=[content_summary(b) for b in response.content],
+                )
 
                 if response.stop_reason == "refusal":
                     category = response.stop_details.category if response.stop_details else None
@@ -94,15 +111,21 @@ class Agent:
 
                 tool_uses = [b for b in response.content if b.type == "tool_use"]
                 if not tool_uses:
+                    self._record_turn_end(turn_usage, status="ok")
                     return turn_usage  # end_turn: Claude answered
 
                 truncated = response.stop_reason == "max_tokens"
                 results = [self._run_tool(block, truncated) for block in tool_uses]
                 # All results go back in ONE user message, matched to their tool_use ids.
                 self.messages.append({"role": "user", "content": results})
-        except BaseException:
+        except BaseException as e:
             del self.messages[start:]  # covers TurnFailed, API errors and Ctrl+C
+            # The receipt keeps failed turns: what was tried matters even when it was rolled back.
+            self._record_turn_end(turn_usage, status="failed", error=type(e).__name__, message=str(e))
             raise
+
+    def _record_turn_end(self, turn_usage: Usage, **fields: Any) -> None:
+        self._record("turn_end", usage=asdict(turn_usage), cost_usd=turn_usage.cost(self.model), **fields)
 
     @property
     def is_claude(self) -> bool:
@@ -178,6 +201,20 @@ class Agent:
     def _run_tool(self, block: BetaContentBlock, truncated: bool) -> BetaToolResultBlockParam:
         assert block.type == "tool_use"
         self.write(f"{DIM}{json.dumps(block.input, ensure_ascii=False)}{RESET}\n")
+        started = time.monotonic()
+        result = self._tool_result(block, truncated)
+        self._record(
+            "tool_result",
+            id=block.id,
+            name=block.name,
+            is_error=result.get("is_error", False),
+            content=result.get("content"),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        return result
+
+    def _tool_result(self, block: BetaContentBlock, truncated: bool) -> BetaToolResultBlockParam:
+        assert block.type == "tool_use"
         if truncated:
             # max_tokens cut the tool input off. It may still parse, but it is incomplete.
             return _error_result(block.id, "Your tool input was cut off by max_tokens. Send a shorter input.")

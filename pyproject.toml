@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 claude-agent = "claude_agent_cli.cli:main"
+receipts = "claude_agent_cli.receipt:main"
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]

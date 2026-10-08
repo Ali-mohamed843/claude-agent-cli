@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -10,6 +11,7 @@ import anthropic
 import pytest
 
 from claude_agent_cli.agent import FALLBACK_BETA, Agent, TurnFailed
+from claude_agent_cli.recorder import Recorder
 from claude_agent_cli.tools import ToolBox
 
 
@@ -200,3 +202,52 @@ def test_other_models_get_only_core_params(tmp_path: Path) -> None:
     request = client.requests[0]
     assert set(request) == {"model", "max_tokens", "system", "tools", "messages"}
     assert all("eager_input_streaming" not in tool for tool in request["tools"])
+
+
+def read_events(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_recorder_captures_the_tool_loop(tmp_path: Path) -> None:
+    agent, _ = make_agent(
+        tmp_path,
+        [
+            message([tool_use_block("tu_1", "read_file", {"path": "app.py"})], "tool_use"),
+            message([text_block("It prints hi.")], "end_turn"),
+        ],
+    )
+    agent.recorder = Recorder(tmp_path / "session.jsonl")
+    agent.send("what does app.py do?")
+    agent.recorder.close()
+
+    events = read_events(tmp_path / "session.jsonl")
+    assert [e["type"] for e in events] == [
+        "user_message",
+        "model_response",
+        "tool_result",
+        "model_response",
+        "turn_end",
+    ]
+    assert events[1]["content"] == [
+        {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "app.py"}}
+    ]
+    assert events[2]["id"] == "tu_1" and events[2]["is_error"] is False
+    assert "print('hi')" in events[2]["content"]
+    assert events[4]["status"] == "ok"
+    assert events[4]["usage"]["output_tokens"] == 100
+
+
+def test_recorder_keeps_failed_turns(tmp_path: Path) -> None:
+    refused = message([], "refusal", stop_details=SimpleNamespace(category="cyber"))
+    agent, _ = make_agent(tmp_path, [refused])
+    agent.recorder = Recorder(tmp_path / "session.jsonl")
+
+    with pytest.raises(TurnFailed):
+        agent.send("something declined")
+    agent.recorder.close()
+
+    end = read_events(tmp_path / "session.jsonl")[-1]
+    assert end["type"] == "turn_end"
+    assert end["status"] == "failed"
+    assert end["error"] == "TurnFailed"
+    assert agent.messages == []  # rolled back in the conversation, but still on the record
