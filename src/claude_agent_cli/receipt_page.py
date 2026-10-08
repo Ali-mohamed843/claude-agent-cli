@@ -145,6 +145,8 @@ def group(events: list[dict[str, Any]]) -> list[Turn | Marker]:
             current = None
             model = f" on {e['model']}" if e.get("model") else ""
             items.append(Marker("resume", f"Session resumed{model}"))
+        elif kind == "model_change" and current is None:
+            items.append(Marker("resume", f"Switched to {e.get('model', 'another model')}"))
         elif kind == "rename":
             items.append(Marker("rename", f"Renamed to “{e.get('name', '')}”"))
     return items

@@ -21,6 +21,7 @@ It's a tiny version of what tools like Claude Code do, written to understand how
 - **Session recording:** every message, tool call, result, approval and cost is saved as it happens.
 - **Agent receipts:** `receipts share` turns a recording into a redacted, self-contained HTML page you can send to anyone.
 - **Resume:** closed the window by mistake? `claude-agent --resume` continues the same conversation.
+- **Nothing to memorise:** type `/` for a menu of every command, `@` to pick a project file, `?` for help.
 
 ## Install
 
@@ -38,7 +39,7 @@ This installs two commands you can run from any folder: `claude-agent` and `rece
 
 - `--editable` means your code changes apply immediately, and the agent keeps reading its settings from this repo's `.env`.
 - `--force` reinstalls over an existing install. **Run this command again after every `git pull`**, so new commands
-  (like `receipts`) get created.
+  (like `receipts`) and new dependencies (like `prompt-toolkit` for the menus) get installed.
 
 To try it without installing:
 
@@ -50,8 +51,52 @@ uv run claude-agent --root path/to/some/project
 **No Claude credits?** The agent also runs on free models through [OpenRouter](https://openrouter.ai), which offers an
 Anthropic-compatible endpoint. Fill in Option B in `.env`. Claude-only features (thinking, effort, prompt caching,
 refusal fallbacks) are switched off automatically for non-Claude models. Free models share a pool of requests, so you
-may get rate limited (`429`): wait a minute, or switch model with `--model`, for example
-`--model nvidia/nemotron-3-super-120b-a12b:free`.
+may get rate limited (`429`): wait a minute, or switch model without leaving the chat: type `/model` and pick one.
+
+## Using the chat
+
+You don't need to remember any commands:
+
+- **Type `/`** and a menu of every command opens, each with a short description. Keep typing to filter it,
+  use ↑ ↓ to move, and Enter to pick. Commands that need a value (`/model`, `/effort`, `/resume`) then suggest
+  the values, like your recorded sessions or the available models.
+- **Type `@`** to pick a file from your project, e.g. `explain @src/app.py`. Claude reads the file you mention.
+- **Type `?`** (or `/help`) for every command and keyboard shortcut.
+- **The bar at the bottom** shows the key hints, whether the session is being recorded, the model, and what
+  the session has cost so far.
+
+What you see while Claude works:
+
+```
+❯ what does @src/app.py do?
+
+✻ Thinking
+  They want a summary of app.py. Read it first.
+
+● Read src/app.py
+  └ 42 lines
+● Run uv run pytest -q
+  └ Run this command? yes / no  yes
+  └ exit 0 · 3 lines of output · 1.2 s
+
+● src/app.py is the entry point: it loads settings from .env and starts the chat loop.
+
+  ✓ 4.8 s · 12.4k tokens · $0.0421
+```
+
+Keyboard shortcuts:
+
+| Key | What it does |
+|---|---|
+| `/` | Open the command menu |
+| `@` | Mention a file in your project |
+| `Enter` | Send · picks the highlighted menu item |
+| `Alt+Enter` | New line (pasting several lines also works) |
+| `↑` `↓` | Previous messages · move in a menu |
+| `Ctrl+R` | Search your message history (kept in `~/.claude-agent/history`) |
+| `Ctrl+C` | Stop Claude · clear what you typed |
+| `Ctrl+L` | Clear the screen |
+| `Ctrl+D` | Quit |
 
 ## Commands
 
@@ -78,12 +123,22 @@ may get rate limited (`429`): wait a minute, or switch model with `--model`, for
 
 ### Commands inside the chat
 
+Type `/` to see these as a menu.
+
 | Command | What it does |
 |---|---|
-| `/name <title>` | Rename the recorded session |
+| `/help` (or `?`) | Show all commands and keyboard shortcuts |
+| `/share` | Turn this session into a receipt page and open it |
+| `/record [title]` | Start recording this session (if you didn't start with `--record`) |
+| `/name <title>` | Give this session a title (starts recording if it isn't already) |
+| `/sessions` | List your recorded sessions |
+| `/resume <session>` | Switch to a recorded session |
+| `/model <model>` | Switch model, e.g. when a free model is rate limited |
+| `/effort <level>` | How hard Claude thinks: `low`, `medium`, `high`, `xhigh`, `max` |
 | `/cost` | Show tokens and cost so far |
-| `/reset` | Start a new conversation |
-| `/exit` | Quit properly; the recording gets its end marker and you're shown how to resume |
+| `/reset` | Start a new conversation (Claude forgets this one) |
+| `/clear` | Clear the screen |
+| `/exit` | Quit; you're shown where the session was saved and how to continue it |
 
 ### `receipts`: turn recordings into pages
 
@@ -98,9 +153,8 @@ may get rate limited (`429`): wait a minute, or switch model with `--model`, for
 ### A typical session
 
 ```bash
-claude-agent --name "Anthropic research"    # 1. chat (recorded)
-receipts share                              # 2. make the page (works from a second terminal while chatting)
-claude-agent --resume anthropic             # 3. come back to it later
+claude-agent --name "Anthropic research"    # 1. chat (recorded); type /share any time to see the receipt
+claude-agent --resume anthropic             # 2. come back to it later
 ```
 
 ## Recording a session
@@ -158,7 +212,11 @@ you ──► messages ──► Claude ──► stop_reason?
 - [`agent.py`](src/claude_agent_cli/agent.py): the loop. It streams each response, runs the requested tools, and handles stop reasons (`tool_use`, `end_turn`, `max_tokens`, `refusal`).
 - [`tools.py`](src/claude_agent_cli/tools.py): tool schemas (what Claude sees) and implementations (what runs on your machine).
 - [`cost.py`](src/claude_agent_cli/cost.py): token accounting and prices.
-- [`cli.py`](src/claude_agent_cli/cli.py): the terminal chat loop, `--resume`, and error messages.
+- [`cli.py`](src/claude_agent_cli/cli.py): the chat session: start-up flags, slash commands, recording, `--resume`, and error messages.
+- [`ui.py`](src/claude_agent_cli/ui.py): the prompt, the `/` command menu, the `@` file picker, the status bar, the welcome card and help.
+- [`commands.py`](src/claude_agent_cli/commands.py): the list of slash commands, shared by the menu, `/help` and the chat.
+- [`streamtext.py`](src/claude_agent_cli/streamtext.py): wraps and styles Claude's text as it streams in.
+- [`style.py`](src/claude_agent_cli/style.py): colors and symbols (off automatically when output isn't a terminal, or with `NO_COLOR`).
 - [`recorder.py`](src/claude_agent_cli/recorder.py): writes the session to JSONL and finds recordings by name.
 - [`resume.py`](src/claude_agent_cli/resume.py): rebuilds a conversation from a recording.
 - [`receipt.py`](src/claude_agent_cli/receipt.py): the `receipts` command and redaction.

@@ -1,29 +1,49 @@
-"""Command-line entry point: a chat loop in the terminal."""
+"""Command-line entry point: the interactive chat in the terminal."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
 
+from . import ui
 from .agent import DEFAULT_MODEL, Agent, TurnFailed
-from .recorder import FORMAT_VERSION, RECEIPTS_DIR, Recorder, default_record_path, find_recording, load_events
-from .resume import restore
+from .commands import EFFORT_LEVELS, Command, parse
+from .cost import PRICES
+from .recorder import (
+    FORMAT_VERSION,
+    RECEIPTS_DIR,
+    Recorder,
+    default_record_path,
+    display_name,
+    find_recording,
+    load_events,
+    recordings,
+)
+from .resume import Restored, restore
+from .style import BULLET, fmt_cost, fmt_seconds, fmt_tokens, middle_truncate, paint
 from .tools import ToolBox
 
-HELP = "Commands: /cost (session usage), /reset (new conversation), /exit (quit)"
-RECORDING_HELP = "Recording: /name <title> renames the session; `receipts share` turns it into a web page"
 AUTO_RECORD_PATH = Path("<auto>")  # `--record` with no path: pick a name under the project root
+HISTORY_FILE = Path.home() / ".claude-agent" / "history"
 
-
-def confirm_command(command: str) -> bool:
-    answer = input(f"\n  Run `{command}`? [y/N] ").strip().lower()
-    return answer in {"y", "yes"}
+# Free OpenRouter models that support tool use (checked October 2026; the list changes, any model ID works).
+FREE_MODELS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-31b-it:free",
+    "cohere/north-mini-code:free",
+    "thinkingmachines/inkling:free",
+    "poolside/laguna-s-2.1:free",
+    "dots-studio/dots-3-note-preview:free",
+]
 
 
 def error_type(error: anthropic.APIStatusError) -> str | None:
@@ -39,7 +59,10 @@ def error_type(error: anthropic.APIStatusError) -> str | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="claude-agent", description="A small coding agent for your terminal.")
+    parser = argparse.ArgumentParser(
+        prog="claude-agent",
+        description="A small coding agent for your terminal. Inside the chat, type / to see every command.",
+    )
     parser.add_argument(
         "--model",
         default=os.environ.get("AGENT_MODEL", DEFAULT_MODEL),
@@ -48,7 +71,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--effort",
         default="high",
-        choices=["low", "medium", "high", "xhigh", "max"],
+        choices=EFFORT_LEVELS,
         help="How hard Claude thinks before answering (default: high)",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Project folder the tools can access")
@@ -81,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(override=True)
     args = parse_args(argv)
 
+    if args.resume is not None and args.record is not None:
+        print("--resume keeps writing to the session's own file; leave out --record.", file=sys.stderr)
+        return 1
+
     client = anthropic.Anthropic()
     if not (client.api_key or client.auth_token or client.credentials):
         print(
@@ -90,73 +117,363 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    toolbox = ToolBox(root=args.root, confirm=confirm_command)
+    chat = Chat(client, ToolBox(root=args.root, confirm=lambda _command: False), args.model, args.effort)
+    restored = None
     if args.resume is not None:
-        return resume_session(client, toolbox, args)
-    recorder = None
-    if args.name and args.record is None:
-        args.record = AUTO_RECORD_PATH  # naming a session only makes sense if it is recorded
-    if args.record is not None:
-        path = default_record_path(toolbox.root, args.name) if args.record == AUTO_RECORD_PATH else args.record
-        recorder = Recorder(path)
-        toolbox.confirm = recorder.wrap_confirm(confirm_command)
+        path = find_recording(chat.root, args.resume)
+        if path is None:
+            wanted = f" matching “{args.resume}”" if args.resume else ""
+            print(
+                f"No recorded session{wanted} in {chat.root / RECEIPTS_DIR}. `receipts list` shows them.",
+                file=sys.stderr,
+            )
+            return 1
+        restored = chat.resume(path, args.name)
+    elif args.record is not None or args.name:
+        chat.start_recording(args.name, None if args.record in (None, AUTO_RECORD_PATH) else args.record)
+
+    print(chat.welcome())
+    if restored:
+        print(chat.resumed_summary(restored))
+    return chat.run()
+
+
+class Chat:
+    """One interactive session: the agent, its recording, and the commands that act on them."""
+
+    def __init__(self, client: anthropic.Anthropic, toolbox: ToolBox, model: str, effort: str) -> None:
+        self.toolbox = toolbox
+        self.root = toolbox.root
+        self.status = ui.Status(model=model)
+        self.ui = ui.ChatUI(self.root, self.status, self.session_choices, self.model_choices, HISTORY_FILE)
+        toolbox.confirm = self.confirm_command
+        self.agent = Agent(client, toolbox, model=model, effort=effort)
+        self.title: str | None = None
+
+    # ------------------------------------------------------------------------------------------ recording
+
+    @property
+    def recorder(self) -> Recorder | None:
+        return self.agent.recorder
+
+    def start_recording(self, title: str | None, path: Path | None = None) -> Recorder:
+        recorder = Recorder(path or default_record_path(self.root, title))
         recorder.event(
             "session_start",
             format_version=FORMAT_VERSION,
             agent="claude-agent-cli",
-            name=args.name,
-            model=args.model,
-            effort=args.effort,
-            root=str(toolbox.root),
+            name=title,
+            model=self.agent.model,
+            effort=self.agent.effort,
+            root=str(self.root),
         )
-    agent = Agent(client, toolbox, model=args.model, effort=args.effort, recorder=recorder)
+        self.agent.recorder = recorder
+        self.title = title or "Untitled session"
+        self.status.recording = self.title
+        return recorder
 
-    print(f"claude-agent · {args.model} · effort {args.effort} · {toolbox.root}")
-    print(HELP)
-    if recorder:
-        print(f"Recording to {recorder.path}")
-        print(RECORDING_HELP)
-    return run(agent)
+    def stop_recording(self) -> None:
+        recorder = self.recorder
+        if recorder is None:
+            return
+        usage = self.agent.session_usage
+        recorder.event("session_end", usage=asdict(usage), cost_usd=self.agent.session_cost)
+        recorder.close()
+        self.agent.recorder = None
+        self.status.recording = None
 
+    def resume(self, path: Path, title: str | None = None) -> Restored:
+        self.stop_recording()
+        restored = restore(load_events(path))
+        recorder = Recorder(path, elapsed_offset_ms=restored.elapsed_ms)
+        recorder.event(
+            "session_resume", model=self.agent.model, effort=self.agent.effort, turns_restored=restored.turns
+        )
+        if title:
+            recorder.event("rename", name=title)
+        self.agent.recorder = recorder
+        self.agent.messages = restored.messages
+        self.agent.session_usage = restored.usage
+        self.agent.session_cost = restored.cost
+        self.title = title or restored.name
+        self.status.recording = self.title
+        self.update_cost()
+        return restored
 
-def resume_session(client: anthropic.Anthropic, toolbox: ToolBox, args: argparse.Namespace) -> int:
-    if args.record is not None:
-        print("--resume keeps writing to the session's own file; leave out --record.", file=sys.stderr)
-        return 1
-    path = find_recording(toolbox.root, args.resume)
-    if path is None:
-        where = toolbox.root / RECEIPTS_DIR
-        wanted = f" matching “{args.resume}”" if args.resume else ""
-        print(f"No recorded session{wanted} in {where}. `receipts list` shows what is there.", file=sys.stderr)
-        return 1
+    def confirm_command(self, command: str) -> bool:
+        approved = self.ui.confirm("Run this command?")
+        if self.recorder:
+            self.recorder.event("approval", command=command, approved=approved)
+        return approved
 
-    restored = restore(load_events(path))
-    recorder = Recorder(path, elapsed_offset_ms=restored.elapsed_ms)
-    toolbox.confirm = recorder.wrap_confirm(confirm_command)
-    recorder.event("session_resume", model=args.model, effort=args.effort, turns_restored=restored.turns)
-    if args.name:
-        recorder.event("rename", name=args.name)
+    # ------------------------------------------------------------------------------------------ screens
 
-    agent = Agent(client, toolbox, model=args.model, effort=args.effort, recorder=recorder)
-    agent.messages = restored.messages
-    agent.session_usage = restored.usage
+    def welcome(self) -> str:
+        model = paint(self.agent.model, "accent")
+        if self.agent.is_claude:
+            model += paint(f" · effort {self.agent.effort}", "gray")
+        elif self.agent.model.endswith(":free"):
+            model += paint(" · free", "gray")
+        if self.recorder:
+            session = paint("● recording", "red") + f" “{self.title}”"
+        else:
+            session = paint("○ not recorded", "gray") + paint(" · /record to start", "gray")
+        rows = [("Model", model), ("Folder", middle_truncate(str(self.root), 52)), ("Session", session)]
+        return "\n" + ui.welcome_card(rows) + "\n" + ui.hint_line()
 
-    print(f"claude-agent · {args.model} · effort {args.effort} · {toolbox.root}")
-    print(HELP)
-    title = args.name or restored.name
-    turns = f"{restored.turns} turn{'s' if restored.turns != 1 else ''}"
-    print(f"\nResumed “{title}”: {turns} restored, recording to {recorder.path}")
-    if restored.skipped_turns:
-        print(f"  ({restored.skipped_turns} failed or unfinished turn(s) left out; they never got an answer)")
-    if restored.model and restored.model != args.model:
-        print(f"  (last time this session used {restored.model}; pass --model to switch back)")
-    if restored.last_question:
-        print(f"\033[2m  Last question: {shorten(restored.last_question)}")
-        print(f"  Last answer:   {shorten(restored.last_answer or '')}\033[0m")
-    if restored.unanswered:
-        print(f"  Your last message never got an answer: “{shorten(restored.unanswered)}”. Send it again to retry.")
-    print(RECORDING_HELP)
-    return run(agent)
+    def resumed_summary(self, restored: Restored) -> str:
+        turns = f"{restored.turns} turn{'s' if restored.turns != 1 else ''}"
+        lines = ["", ui.notice(f"Resumed “{self.title}” · {turns} restored", "ok")]
+        if restored.last_question:
+            lines.append(ui.notice(paint(f"You:    {shorten(restored.last_question, 90)}", "gray")))
+            lines.append(ui.notice(paint(f"Claude: {shorten(restored.last_answer or '', 90)}", "gray")))
+        if restored.skipped_turns:
+            lines.append(ui.notice(f"{restored.skipped_turns} unanswered turn(s) left out", "warn"))
+        if restored.unanswered:
+            lines.append(
+                ui.notice(f"Never answered: “{shorten(restored.unanswered, 80)}”. Send it again to retry.", "warn")
+            )
+        if restored.model and restored.model != self.agent.model:
+            lines.append(ui.notice(f"Last time this used {restored.model}. Switch back with /model {restored.model}"))
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------------------------------ choices for menus
+
+    def session_choices(self) -> list[tuple[str, str]]:
+        choices = []
+        for path in recordings(self.root)[:30]:
+            events = load_events(path)
+            turns = sum(e["type"] == "turn_end" and e.get("status") == "ok" for e in events)
+            choices.append(
+                (display_name(events), f"{ago(path.stat().st_mtime)} · {turns} turn{'s' if turns != 1 else ''}")
+            )
+        return choices
+
+    def model_choices(self) -> list[tuple[str, str]]:
+        if "openrouter" in os.environ.get("ANTHROPIC_BASE_URL", ""):
+            return [(model, "free · OpenRouter") for model in FREE_MODELS]
+        return [(model, f"${prices[0]:g} / ${prices[1]:g} per M tokens") for model, prices in PRICES.items()]
+
+    def session_tokens(self) -> int:
+        usage = self.agent.session_usage
+        return usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+
+    def update_cost(self) -> None:
+        tokens = self.session_tokens()
+        self.status.model = self.agent.model
+        self.status.tokens = f"{fmt_tokens(tokens)} tokens" if tokens else ""
+        self.status.cost = fmt_cost(self.agent.session_cost) if tokens else ""
+
+    # ------------------------------------------------------------------------------------------ the loop
+
+    def run(self) -> int:
+        try:
+            return self.loop()
+        finally:
+            self.goodbye()
+
+    def loop(self) -> int:
+        while True:
+            try:
+                text = self.ui.read()
+            except KeyboardInterrupt:
+                print(ui.notice("Ctrl+D or /exit quits."))
+                continue
+            except EOFError:
+                return 0
+            if not text.strip():
+                continue
+            parsed = parse(text)
+            if parsed is not None:
+                command, arg = parsed
+                if command is None:
+                    print(ui.notice(f"{arg} isn't a command. Type / to see them all.", "warn"))
+                    continue
+                if not self.handle(command, arg):
+                    return 0
+                continue
+            if not self.send(text.strip()):
+                return 1
+
+    def send(self, text: str) -> bool:
+        """Run one turn. Returns False only for errors that make continuing pointless."""
+        started = time.monotonic()
+        try:
+            usage = self.agent.send(text)
+        except KeyboardInterrupt:
+            print("\n" + ui.notice("Stopped. Your last message was dropped from the conversation.", "warn"))
+            return True
+        except TurnFailed as e:
+            print("\n" + ui.notice(f"{e} Your last message was dropped.", "error"))
+            return True
+        except anthropic.AuthenticationError:
+            print("\n" + ui.notice("Invalid API key. Check the key in your .env file.", "error"))
+            return False
+        except anthropic.NotFoundError:
+            print("\n" + ui.notice(f"Model “{self.agent.model}” was not found. Pick another with /model.", "error"))
+            return True
+        except anthropic.RateLimitError:
+            print("\n" + ui.notice("Rate limited. Wait a minute and send it again, or switch with /model.", "error"))
+            return True
+        except anthropic.APIStatusError as e:
+            if error_type(e) == "overloaded_error":
+                print("\n" + ui.notice("The model is overloaded. Wait a moment, or switch with /model.", "error"))
+            else:
+                print("\n" + ui.notice(f"API error {e.status_code}: {e.message}", "error"))
+            return True
+        except anthropic.APIConnectionError:
+            print("\n" + ui.notice("Network error. Check your internet connection.", "error"))
+            return True
+        finally:
+            self.update_cost()
+
+        tokens = usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+        parts = [
+            fmt_seconds(time.monotonic() - started),
+            f"{fmt_tokens(tokens)} tokens",
+            fmt_cost(usage.cost(self.agent.model)),
+        ]
+        print(paint(f"\n  ✓ {' · '.join(parts)}", "gray"))
+        return True
+
+    # ------------------------------------------------------------------------------------------ commands
+
+    def handle(self, command: Command, arg: str) -> bool:
+        """Run a slash command. Returns False when the chat should end."""
+        name = command.name
+        if command.arg_required and not arg:
+            print(ui.notice(f"Usage: {command.usage}  ({command.description.lower()})", "warn"))
+            return True
+        if name == "exit":
+            return False
+        if name == "help":
+            print(ui.help_screen())
+        elif name == "clear":
+            self.ui.clear()
+        elif name == "cost":
+            u = self.agent.session_usage
+            print(ui.notice(f"This session: {fmt_cost(self.agent.session_cost)}"))
+            print(
+                ui.notice(
+                    paint(f"input {u.input_tokens:,} · output {u.output_tokens:,} · ", "gray")
+                    + paint(f"cache read {u.cache_read_tokens:,} · cache write {u.cache_write_tokens:,}", "gray")
+                )
+            )
+        elif name == "reset":
+            self.agent.reset()
+            print(ui.notice("New conversation. Claude has forgotten the earlier messages.", "ok"))
+        elif name == "record":
+            self.cmd_record(arg)
+        elif name == "name":
+            self.cmd_name(arg)
+        elif name == "share":
+            self.cmd_share()
+        elif name == "sessions":
+            self.cmd_sessions()
+        elif name == "resume":
+            self.cmd_resume(arg)
+        elif name == "model":
+            self.cmd_model(arg)
+        elif name == "effort":
+            self.cmd_effort(arg)
+        return True
+
+    def cmd_record(self, title: str) -> None:
+        if self.recorder:
+            print(ui.notice(f"Already recording to {self.recorder.path}"))
+            return
+        recorder = self.start_recording(title or None)
+        print(ui.notice(f"Recording to {recorder.path}", "ok"))
+        if self.agent.messages:
+            print(ui.notice("Earlier messages in this chat aren't in the recording; everything from now on is."))
+
+    def cmd_name(self, title: str) -> None:
+        if self.recorder is None:
+            self.start_recording(title)
+            print(ui.notice(f"Recording started as “{title}”", "ok"))
+            return
+        self.recorder.event("rename", name=title)
+        self.title = self.status.recording = title
+        print(ui.notice(f"Session named “{title}”", "ok"))
+
+    def cmd_share(self) -> None:
+        if self.recorder is None:
+            print(
+                ui.notice("This session isn't recorded yet. Start with /record, then /share after a message.", "warn")
+            )
+            return
+        from .receipt import share
+
+        share(self.recorder.path, None, open_browser=True)
+
+    def cmd_sessions(self) -> None:
+        files = recordings(self.root)
+        if not files:
+            print(ui.notice("No recorded sessions yet. /record starts one."))
+            return
+        current = self.recorder.path.resolve() if self.recorder else None
+        print()
+        for path in files[:15]:
+            events = load_events(path)
+            turns = sum(e["type"] == "turn_end" and e.get("status") == "ok" for e in events)
+            marker = paint(BULLET, "red") if path.resolve() == current else " "
+            name = shorten(display_name(events), 50)
+            meta = paint(f"{ago(path.stat().st_mtime)} · {turns} turn{'s' if turns != 1 else ''}", "gray")
+            print(f"  {marker} {name}  {meta}")
+        if len(files) > 15:
+            print(ui.notice(f"and {len(files) - 15} older"))
+        print(ui.notice("Switch with /resume <name>"))
+
+    def cmd_resume(self, query: str) -> None:
+        path = find_recording(self.root, query)
+        if path is None:
+            print(ui.notice(f"No session matching “{query}”. /sessions lists them.", "warn"))
+            return
+        if self.recorder and path.resolve() == self.recorder.path.resolve():
+            print(ui.notice("That's the session you're in."))
+            return
+        print(self.resumed_summary(self.resume(path)))
+
+    def cmd_model(self, model: str) -> None:
+        if model == self.agent.model:
+            print(ui.notice(f"Already using {model}"))
+            return
+        self.agent.switch_model(model)
+        self.update_cost()
+        print(ui.notice(f"Now using {paint(model, 'accent')}", "ok"))
+        if not self.agent.is_claude:
+            print(ui.notice(paint("Thinking, effort and prompt caching only work with Claude models.", "gray")))
+
+    def cmd_effort(self, level: str) -> None:
+        if level not in EFFORT_LEVELS:
+            print(ui.notice(f"Effort must be one of: {', '.join(EFFORT_LEVELS)}", "warn"))
+            return
+        self.agent.effort = level
+        note = "" if self.agent.is_claude else f" (only used by Claude models; you're on {self.agent.model})"
+        print(ui.notice(f"Effort set to {level}{note}", "ok"))
+
+    # ------------------------------------------------------------------------------------------ the end
+
+    def goodbye(self) -> None:
+        """The last thing on screen: what the session cost, where it's saved, and how to get back to it."""
+        print()
+        tokens = self.session_tokens()
+        if tokens:
+            print(ui.notice(f"{fmt_tokens(tokens)} tokens · {fmt_cost(self.agent.session_cost)} this session"))
+        if self.recorder:
+            path = self.recorder.path
+            title = self.title or ""
+            self.stop_recording()
+            try:
+                shown = str(path.relative_to(self.root))
+            except ValueError:
+                shown = str(path)
+            print(ui.notice(f"Saved {paint(shown, 'gray')}", "ok"))
+            named = title and title != "Untitled session"
+            resume = f'claude-agent --resume "{title}"' if named else "claude-agent --resume"
+            print(f"    {paint('Continue', 'gray')}  {paint(resume, 'accent')}")
+            print(f"    {paint('Share', 'gray')}     {paint('receipts share', 'accent')}")
+        print(paint(f"\n  {BULLET} See you soon!", "accent"))
 
 
 def shorten(text: str, limit: int = 100) -> str:
@@ -164,80 +481,17 @@ def shorten(text: str, limit: int = 100) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def run(agent: Agent) -> int:
-    """Run the chat, and close the recording properly however the chat ends."""
-    try:
-        return chat_loop(agent, agent.model)
-    finally:
-        if agent.recorder:
-            usage = agent.session_usage
-            agent.recorder.event("session_end", usage=asdict(usage), cost_usd=usage.cost(agent.model))
-            agent.recorder.close()
-            print(f"Session recorded to {agent.recorder.path}")
-            print("Continue it later with `claude-agent --resume`, or view it with `receipts share`.")
-
-
-def rename(agent: Agent, name: str) -> None:
-    if not agent.recorder:
-        print("This session is not being recorded. Start with --record (or --name) to name it.")
-    elif not name:
-        print("Usage: /name <title>")
-    else:
-        agent.recorder.event("rename", name=name)
-        print(f"Session named “{name}”.")
-
-
-def chat_loop(agent: Agent, model: str) -> int:
-    while True:
-        try:
-            user_text = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not user_text:
-            continue
-        if user_text in {"/exit", "/quit"}:
-            break
-        if user_text == "/cost":
-            print(f"Session: {agent.session_usage.summary(model)}")
-            continue
-        if user_text == "/reset":
-            agent.reset()
-            print("Started a new conversation.")
-            continue
-        if user_text == "/name" or user_text.startswith("/name "):
-            rename(agent, user_text.removeprefix("/name").strip())
-            continue
-        if user_text.startswith("/"):
-            print(HELP)
-            continue
-
-        try:
-            usage = agent.send(user_text)
-            print(f"\033[2m[{usage.summary(model)}]\033[0m")
-        except KeyboardInterrupt:
-            print("\n[interrupted; your last message was dropped from the conversation]")
-        except TurnFailed as e:
-            print(f"\n[{e} Your last message was dropped from the conversation.]")
-        except anthropic.AuthenticationError:
-            print("\n[Invalid API key. Check the key in your .env file.]")
-            return 1
-        except anthropic.NotFoundError:
-            print(f"\n[Model '{model}' was not found. Check the --model value.]")
-            return 1
-        except anthropic.RateLimitError:
-            print("\n[Rate limited. Wait a moment and try again.]")
-        except anthropic.APIStatusError as e:
-            if error_type(e) == "overloaded_error":
-                print("\n[The model is overloaded right now. Wait a moment and send your message again.]")
-            else:
-                print(f"\n[API error {e.status_code}: {e.message}]")
-        except anthropic.APIConnectionError:
-            print("\n[Network error. Check your internet connection.]")
-
-    print(f"Session: {agent.session_usage.summary(model)}")
-    return 0
+def ago(timestamp: float) -> str:
+    seconds = max(0, time.time() - timestamp)
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h ago"
+    if seconds < 7 * 86400:
+        return f"{int(seconds // 86400)} d ago"
+    return datetime.fromtimestamp(timestamp).strftime("%d %b")
 
 
 if __name__ == "__main__":

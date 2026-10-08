@@ -22,6 +22,7 @@ from .recorder import display_name
 class Restored:
     messages: list[BetaMessageParam] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    cost: float | None = 0.0  # summed from each turn, at the price of the model it ran on
     turns: int = 0  # completed turns in the restored conversation
     skipped_turns: int = 0  # failed or unfinished turns left out
     name: str = ""
@@ -46,7 +47,7 @@ def restore(events: list[dict[str, Any]]) -> Restored:
     for e in events:
         kind = e["type"]
         restored.elapsed_ms = max(restored.elapsed_ms, e.get("elapsed_ms", 0))
-        if kind in {"session_start", "session_resume"} and e.get("model"):
+        if kind in {"session_start", "session_resume", "model_change"} and e.get("model"):
             restored.model = e["model"]
         elif kind == "reset":
             restored.messages, restored.turns, restored.unanswered = [], 0, None
@@ -79,6 +80,8 @@ def restore(events: list[dict[str, Any]]) -> Restored:
                 usage.get("cache_read_tokens", 0),
                 usage.get("cache_write_tokens", 0),
             )
+            cost = e.get("cost_usd")
+            restored.cost = None if cost is None or restored.cost is None else restored.cost + cost
             if e.get("status") == "ok" and not broken and turn[-1]["role"] == "assistant":
                 restored.messages.extend(cast(list[BetaMessageParam], turn))
                 restored.turns += 1
