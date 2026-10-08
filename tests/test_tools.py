@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_agent_cli.tools import MAX_SEARCH_MATCHES, ToolBox, ToolError, truncate, validate_args
+from claude_agent_cli.tools import MAX_SEARCH_MATCHES, ToolBox, ToolError, glob_matches, truncate, validate_args
 
 
 @pytest.fixture
@@ -90,3 +90,26 @@ def test_unknown_tool() -> None:
 def test_truncate() -> None:
     assert truncate("short", limit=10) == "short"
     assert truncate("a" * 15, limit=10) == "a" * 10 + "\n[output truncated: 5 more characters]"
+
+
+@pytest.mark.parametrize(
+    ("path", "glob", "expected"),
+    [
+        ("src/pkg/agent.py", "*.py", True),
+        ("src/pkg/agent.py", "src/**/*", True),
+        ("src/agent.py", "src/**/*.py", True),
+        ("src/pkg/agent.py", "**/*.py", True),
+        ("tests/test_a.py", "src/**/*", False),
+        ("notes.md", "*.py", False),
+    ],
+)
+def test_glob_matches_path_or_name(path: str, glob: str, expected: bool) -> None:
+    assert glob_matches(path, glob) is expected
+
+
+def test_search_with_path_glob(tmp_path: Path) -> None:
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "agent.py").write_text("refusal handling\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("refusal elsewhere\n", encoding="utf-8")
+    output = make_toolbox(tmp_path).run("search_files", {"pattern": "refusal", "glob": "src/**/*"})
+    assert output == "src/pkg/agent.py:1: refusal handling"

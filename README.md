@@ -28,6 +28,16 @@ uv sync
 uv run claude-agent --root path/to/some/project
 ```
 
+To use it in any folder, install it as a command:
+
+```bash
+uv tool install --editable .
+cd path/to/any/project
+claude-agent
+```
+
+`--editable` means your code changes apply immediately, and the agent keeps reading its settings from this repo's `.env`.
+
 **No Claude credits?** The agent also runs on free models through [OpenRouter](https://openrouter.ai), which offers an
 Anthropic-compatible endpoint. Fill in Option B in `.env`. Claude-only features (thinking, effort, prompt caching,
 refusal fallbacks) are switched off automatically for non-Claude models.

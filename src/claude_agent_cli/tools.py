@@ -7,6 +7,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,10 @@ TOOL_DEFINITIONS: list[BetaToolParam] = [
                 "pattern": {"type": "string", "description": "Python regular expression to search for."},
                 "glob": {
                     "type": "string",
-                    "description": "Optional filename glob to limit the search, e.g. '*.py'. Defaults to all files.",
+                    "description": (
+                        "Optional glob to limit the search, matched against the path from the project root "
+                        "or the file name, e.g. '*.py' or 'src/**/*.py'. Defaults to all files."
+                    ),
                 },
             },
             "required": ["pattern"],
@@ -161,8 +165,22 @@ class ToolBox:
         files: list[Path] = []
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = sorted(d for d in dirnames if d not in SKIPPED_DIRS)
-            files.extend(Path(dirpath) / name for name in sorted(filenames) if Path(name).match(glob))
+            for name in sorted(filenames):
+                file = Path(dirpath) / name
+                if glob_matches(file.relative_to(self.root).as_posix(), glob):
+                    files.append(file)
         return files
+
+
+def glob_matches(relative_path: str, glob: str) -> bool:
+    """Match a glob against a file's project-relative path or its bare name.
+
+    Models write globs both ways ('*.py', 'src/**/*.py'), so accept either. '**/' may match
+    zero folders, so also try the pattern with it removed ('src/**/*.py' matches 'src/a.py').
+    """
+    name = relative_path.rsplit("/", 1)[-1]
+    patterns = {glob, glob.replace("**/", "")}
+    return any(fnmatch(relative_path, p) or fnmatch(name, p) for p in patterns)
 
 
 def validate_args(name: str, args: object) -> None:
