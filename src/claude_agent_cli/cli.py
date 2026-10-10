@@ -17,6 +17,7 @@ from . import ui
 from .agent import DEFAULT_MODEL, Agent, TurnFailed
 from .commands import EFFORT_LEVELS, Command, parse
 from .cost import PRICES
+from .proof import Signer
 from .recorder import (
     FORMAT_VERSION,
     RECEIPTS_DIR,
@@ -85,6 +86,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--name", help="Name of the recorded session, shown as the receipt's title")
     parser.add_argument(
+        "--budget",
+        type=parse_budget,
+        metavar="USD",
+        help="Spending limit for the session, e.g. 0.50; Claude is told what is left and stops to ask at the limit",
+    )
+    parser.add_argument(
         "--resume",
         nargs="?",
         const="",
@@ -132,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.record is not None or args.name:
         chat.start_recording(args.name, None if args.record in (None, AUTO_RECORD_PATH) else args.record)
 
+    if args.budget is not None:
+        chat.agent.set_budget(args.budget)
+        chat.update_cost()
     print(chat.welcome())
     if restored:
         print(chat.resumed_summary(restored))
@@ -148,7 +158,9 @@ class Chat:
         self.ui = ui.ChatUI(self.root, self.status, self.session_choices, self.model_choices, HISTORY_FILE)
         toolbox.confirm = self.confirm_command
         self.agent = Agent(client, toolbox, model=model, effort=effort)
+        self.agent.on_budget = self.confirm_over_budget
         self.title: str | None = None
+        self.signer = load_signer()
 
     # ------------------------------------------------------------------------------------------ recording
 
@@ -157,7 +169,7 @@ class Chat:
         return self.agent.recorder
 
     def start_recording(self, title: str | None, path: Path | None = None) -> Recorder:
-        recorder = Recorder(path or default_record_path(self.root, title))
+        recorder = Recorder(path or default_record_path(self.root, title), signer=self.signer)
         recorder.event(
             "session_start",
             format_version=FORMAT_VERSION,
@@ -165,7 +177,8 @@ class Chat:
             name=title,
             model=self.agent.model,
             effort=self.agent.effort,
-            root=str(self.root),
+            # No absolute root path: it would always be redacted, leaving this line unverifiable in receipts.
+            project=self.root.name,
         )
         self.agent.recorder = recorder
         self.title = title or "Untitled session"
@@ -185,7 +198,7 @@ class Chat:
     def resume(self, path: Path, title: str | None = None) -> Restored:
         self.stop_recording()
         restored = restore(load_events(path))
-        recorder = Recorder(path, elapsed_offset_ms=restored.elapsed_ms)
+        recorder = Recorder(path, elapsed_offset_ms=restored.elapsed_ms, signer=self.signer)
         recorder.event(
             "session_resume", model=self.agent.model, effort=self.agent.effort, turns_restored=restored.turns
         )
@@ -195,6 +208,7 @@ class Chat:
         self.agent.messages = restored.messages
         self.agent.session_usage = restored.usage
         self.agent.session_cost = restored.cost
+        self.agent.budget = restored.budget  # the budget carries over; --budget or /budget changes it
         self.title = title or restored.name
         self.status.recording = self.title
         self.update_cost()
@@ -216,9 +230,14 @@ class Chat:
             model += paint(" · free", "gray")
         if self.recorder:
             session = paint("● recording", "red") + f" “{self.title}”"
+            if self.signer:
+                session += paint(" · sealed", "green")
         else:
             session = paint("○ not recorded", "gray") + paint(" · /record to start", "gray")
         rows = [("Model", model), ("Folder", middle_truncate(str(self.root), 52)), ("Session", session)]
+        if self.agent.budget is not None:
+            spent = fmt_cost(self.agent.session_cost)
+            rows.append(("Budget", f"${self.agent.budget:.2f}" + paint(f" · {spent} spent", "gray")))
         return "\n" + ui.welcome_card(rows) + "\n" + ui.hint_line()
 
     def resumed_summary(self, restored: Restored) -> str:
@@ -262,7 +281,10 @@ class Chat:
         tokens = self.session_tokens()
         self.status.model = self.agent.model
         self.status.tokens = f"{fmt_tokens(tokens)} tokens" if tokens else ""
-        self.status.cost = fmt_cost(self.agent.session_cost) if tokens else ""
+        cost = fmt_cost(self.agent.session_cost) if tokens else ""
+        if self.agent.budget is not None:
+            cost = f"{fmt_cost(self.agent.session_cost or 0.0)} / ${self.agent.budget:.2f}"
+        self.status.cost = cost
 
     # ------------------------------------------------------------------------------------------ the loop
 
@@ -353,6 +375,9 @@ class Chat:
         elif name == "cost":
             u = self.agent.session_usage
             print(ui.notice(f"This session: {fmt_cost(self.agent.session_cost)}"))
+            if self.agent.budget is not None:
+                left = max(self.agent.budget - (self.agent.session_cost or 0.0), 0)
+                print(ui.notice(f"Budget: ${self.agent.budget:.2f} · ${left:.4f} left"))
             print(
                 ui.notice(
                     paint(f"input {u.input_tokens:,} · output {u.output_tokens:,} · ", "gray")
@@ -374,6 +399,8 @@ class Chat:
             self.cmd_resume(arg)
         elif name == "model":
             self.cmd_model(arg)
+        elif name == "budget":
+            self.cmd_budget(arg)
         elif name == "effort":
             self.cmd_effort(arg)
         return True
@@ -444,6 +471,31 @@ class Chat:
         if not self.agent.is_claude:
             print(ui.notice(paint("Thinking, effort and prompt caching only work with Claude models.", "gray")))
 
+    def cmd_budget(self, value: str) -> None:
+        try:
+            amount = parse_budget(value)
+        except argparse.ArgumentTypeError as e:
+            print(ui.notice(str(e), "warn"))
+            return
+        self.agent.set_budget(amount)
+        self.update_cost()
+        if amount is None:
+            print(ui.notice("No budget: Claude can spend without a limit.", "ok"))
+            return
+        print(
+            ui.notice(
+                f"Budget set to ${amount:.2f} for this session ({fmt_cost(self.agent.session_cost)} spent).", "ok"
+            )
+        )
+        if self.agent.session_cost is None:
+            print(ui.notice(f"There's no known price for {self.agent.model}, so the budget can't be enforced.", "warn"))
+        elif self.agent.model.endswith(":free"):
+            print(ui.notice("You're on a free model, so this budget won't be reached.", "info"))
+
+    def confirm_over_budget(self, spent: float, budget: float) -> bool:
+        print("\n" + ui.notice(f"Your ${budget:.2f} budget is used up ({fmt_cost(spent)} spent).", "warn"))
+        return self.ui.confirm("Let Claude finish this turn anyway?")
+
     def cmd_effort(self, level: str) -> None:
         if level not in EFFORT_LEVELS:
             print(ui.notice(f"Effort must be one of: {', '.join(EFFORT_LEVELS)}", "warn"))
@@ -469,11 +521,36 @@ class Chat:
             except ValueError:
                 shown = str(path)
             print(ui.notice(f"Saved {paint(shown, 'gray')}", "ok"))
+            if self.signer:
+                print(f"    {paint('Sealed', 'gray')}    with your key {paint(self.signer.fingerprint, 'green')}")
             named = title and title != "Untitled session"
             resume = f'claude-agent --resume "{title}"' if named else "claude-agent --resume"
             print(f"    {paint('Continue', 'gray')}  {paint(resume, 'accent')}")
             print(f"    {paint('Share', 'gray')}     {paint('receipts share', 'accent')}")
         print(paint(f"\n  {BULLET} See you soon!", "accent"))
+
+
+def parse_budget(value: str) -> float | None:
+    """'0.50', '$2' or '1.5' as dollars; 'off', 'none' or '0' for no budget."""
+    text = value.strip().lower().removeprefix("$")
+    if text in {"off", "none", "no", "0", ""}:
+        return None
+    try:
+        amount = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"“{value}” isn't an amount. Try /budget 0.50, or /budget off.") from None
+    if amount <= 0 or amount != amount or amount == float("inf"):
+        raise argparse.ArgumentTypeError("The budget must be a positive amount of dollars, like 0.50.")
+    return amount
+
+
+def load_signer() -> Signer | None:
+    """The user's signing key for sealing recordings, created on first use. None if it can't be read."""
+    try:
+        return Signer.load_or_create()
+    except (OSError, ValueError) as e:
+        print(ui.notice(f"Recordings won't be sealed: couldn't use your signing key ({e}).", "warn"))
+        return None
 
 
 def shorten(text: str, limit: int = 100) -> str:

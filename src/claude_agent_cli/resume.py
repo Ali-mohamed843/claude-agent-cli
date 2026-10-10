@@ -31,6 +31,7 @@ class Restored:
     last_question: str | None = None
     last_answer: str | None = None
     unanswered: str | None = None  # the last message, when its turn failed or never finished
+    budget: float | None = None  # the session's budget, if one was set
 
 
 def restore(events: list[dict[str, Any]]) -> Restored:
@@ -49,6 +50,8 @@ def restore(events: list[dict[str, Any]]) -> Restored:
         restored.elapsed_ms = max(restored.elapsed_ms, e.get("elapsed_ms", 0))
         if kind in {"session_start", "session_resume", "model_change"} and e.get("model"):
             restored.model = e["model"]
+        elif kind == "budget":
+            restored.budget = e.get("amount")
         elif kind == "reset":
             restored.messages, restored.turns, restored.unanswered = [], 0, None
             turn = None

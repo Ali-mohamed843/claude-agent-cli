@@ -26,7 +26,7 @@ from prompt_toolkit.shortcuts import clear as clear_screen
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
-from .commands import COMMANDS, EFFORT_LEVELS, GROUPS, SHORTCUTS, find_command
+from .commands import BUDGET_CHOICES, COMMANDS, EFFORT_LEVELS, GROUPS, SHORTCUTS, find_command
 from .style import ACCENT_HEX, BRANCH, BULLET, MARK, middle_truncate, paint, term_width
 from .tools import SKIPPED_DIRS
 
@@ -160,6 +160,8 @@ class ChatCompleter(Completer):
             options = self.models()
         elif command.name == "effort":
             options = [(level, "") for level in EFFORT_LEVELS]
+        elif command.name == "budget":
+            options = BUDGET_CHOICES
         needle = typed.lower()
         for value, meta in options:
             if needle in value.lower():
@@ -254,7 +256,7 @@ class ChatUI:
             key_bindings=chat_key_bindings(),
             bottom_toolbar=self._toolbar,
             style=STYLE,
-            reserve_space_for_menu=13,  # room for every command at once
+            reserve_space_for_menu=len(COMMANDS) + 1,  # room for every command at once
             enable_suspend=False,
         )
 

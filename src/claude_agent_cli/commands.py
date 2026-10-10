@@ -31,6 +31,7 @@ COMMANDS: list[Command] = [
     Command("resume", "Switch to a recorded session", "<session>", arg_required=True, group="Receipts"),
     Command("model", "Switch model (handy when you are rate limited)", "<model>", arg_required=True, group="Model"),
     Command("effort", "How hard Claude thinks: low, medium, high, xhigh, max", "<level>", True, group="Model"),
+    Command("budget", "Set a spending limit for this session: /budget 0.50 (or off)", "<amount>", True, group="Model"),
     Command("cost", "Show tokens and cost so far", group="Model"),
     Command("reset", "Start a new conversation (Claude forgets this one)", group="Basics"),
     Command("clear", "Clear the screen", group="Basics"),
@@ -39,6 +40,7 @@ COMMANDS: list[Command] = [
 
 GROUPS = ["Basics", "Receipts", "Model"]
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+BUDGET_CHOICES = [("0.10", "ten cents"), ("0.50", ""), ("1", "one dollar"), ("5", ""), ("off", "no limit")]
 
 SHORTCUTS: list[tuple[str, str]] = [
     ("/", "open the command menu"),

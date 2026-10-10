@@ -92,8 +92,8 @@ svg { display: block; width: 100%; height: 100%; }
 }
 @media (min-width: 1000px) {
   .layout { grid-template-columns: 336px minmax(0, 1fr); gap: 48px; padding: 48px 32px 96px; align-items: start; }
-  .receipt { position: sticky; top: 24px; }
-  .toc ol { max-height: calc(100vh - 560px); min-height: 120px; overflow-y: auto; }
+  .receipt { position: sticky; top: 24px; max-height: calc(100vh - 48px); overflow-y: auto; scrollbar-width: thin; }
+  .toc ol { max-height: calc(100vh - 720px); min-height: 96px; overflow-y: auto; }
 }
 
 /* ------------------------------------------------------------------ receipt */
@@ -147,6 +147,19 @@ svg { display: block; width: 100%; height: 100%; }
 .toc li.interrupted .n, .toc li.open .n { color: var(--warn); }
 .sealed { display: flex; gap: 8px; align-items: center; margin: 16px 0 0; padding-top: 14px; font-size: 12.5px; color: var(--muted); }
 .sealed svg { width: 15px; height: 15px; flex: none; color: var(--ok); }
+
+/* the seal: a stamp on the receipt saying whether the recording is provably unedited */
+.seal { margin-top: 16px; padding: 12px 14px; border-radius: 10px; border: 1.5px solid; font-size: 12.5px; line-height: 1.5; }
+.seal p { margin: 4px 0 0; }
+.seal-head { display: flex; align-items: center; gap: 8px; font: 700 12px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.seal-head svg { width: 18px; height: 18px; flex: none; }
+.seal.ok { border-color: var(--ok); background: var(--ok-soft); color: var(--text); }
+.seal.ok .seal-head { color: var(--ok); }
+.seal.broken { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
+.seal.none { border-color: var(--border-strong); border-style: dashed; color: var(--muted); }
+.seal-key span { font: 600 12px var(--mono); letter-spacing: .04em; }
+.seal-check { color: var(--muted); }
+.seal-check code { font: 11.5px var(--mono); overflow-wrap: anywhere; }
 
 /* ------------------------------------------------------------------ timeline */
 .timeline { min-width: 0; display: grid; gap: 22px; }
@@ -314,5 +327,6 @@ $timeline
     <p>Make your own: <code>claude-agent --record</code> then <code>receipts share</code></p>
   </footer>
 </div>
+$proof
 </body>
 </html>

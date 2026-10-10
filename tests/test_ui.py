@@ -145,7 +145,8 @@ def test_name_starts_a_recording(tmp_path: Path, capsys: Any) -> None:
     chat.send("hi")
     chat.goodbye()
     events = load_events(recordings(tmp_path)[0])
-    assert [e["type"] for e in events][0] == "session_start" and events[-1]["type"] == "session_end"
+    assert [e["type"] for e in events][0] == "session_start"
+    assert [e["type"] for e in events][-2:] == ["session_end", "seal"]  # every session ends sealed
     assert 'claude-agent --resume "IBM research"' in plain(capsys.readouterr().out)
 
 

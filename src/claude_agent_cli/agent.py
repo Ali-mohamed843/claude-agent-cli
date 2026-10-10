@@ -11,7 +11,13 @@ from dataclasses import asdict
 from typing import Any, cast
 
 import anthropic
-from anthropic.types.beta import BetaContentBlock, BetaMessage, BetaMessageParam, BetaToolResultBlockParam
+from anthropic.types.beta import (
+    BetaContentBlock,
+    BetaMessage,
+    BetaMessageParam,
+    BetaTextBlockParam,
+    BetaToolResultBlockParam,
+)
 
 from . import style
 from .cost import Usage
@@ -34,6 +40,13 @@ INDENT = "  "  # Claude's text and thinking line up under the "● " that starts
 
 class TurnFailed(Exception):
     """The turn could not finish (refusal, truncation). The conversation was rolled back."""
+
+
+class BudgetReached(TurnFailed):
+    """The session's budget ran out mid-turn and the user chose to stop."""
+
+
+BUDGET_WARNING = 0.8  # warn once when this share of the budget is spent
 
 
 def build_system_prompt(toolbox: ToolBox) -> str:
@@ -73,6 +86,21 @@ class Agent:
         self._last_output = ""  # what was printed last: "text", "thinking" or "tool"; spacing depends on it
         self._text: StreamText | None = None  # formats the text or thinking block being streamed
         self.session_cost: float | None = 0.0  # summed per response, at the price of the model that answered
+        self.budget: float | None = None  # USD for the whole session; None means no limit
+        # Asked when the budget is used up mid-turn: (spent, budget) -> keep going this turn? No callback: stop.
+        self.on_budget: Callable[[float, float], bool] | None = None
+        self._budget_warned = False
+
+    def set_budget(self, amount: float | None) -> None:
+        self.budget = amount
+        self._budget_warned = self.budget_used() >= BUDGET_WARNING
+        self._record("budget", amount=amount)
+
+    def budget_used(self) -> float:
+        """How much of the budget is spent, 0 to 1 (and beyond). 0 without a budget or a known price."""
+        if not self.budget or self.session_cost is None:
+            return 0.0
+        return self.session_cost / self.budget
 
     def reset(self) -> None:
         """Start a new conversation."""
@@ -105,16 +133,20 @@ class Agent:
         start = len(self.messages)
         turn_usage = Usage()
         self._last_output = ""
-        self.messages.append({"role": "user", "content": user_text})
+        self.messages.append({"role": "user", "content": self._with_budget_note(user_text)})
         self._record("user_message", text=user_text)
+        over_budget_ok = False  # the user agreed to finish this turn past the budget
         try:
             while True:
+                if not over_budget_ok and self.budget_used() >= 1:
+                    over_budget_ok = self._budget_reached()
                 response = self._stream_response()
                 usage = Usage.from_api(response.usage)
                 turn_usage += usage
                 self.session_usage += usage
                 cost = usage.cost(self.model)
                 self.session_cost = None if cost is None or self.session_cost is None else self.session_cost + cost
+                self._warn_if_budget_low()
                 self.messages.append({"role": "assistant", "content": response.content})
                 self._record(
                     "model_response",
@@ -143,6 +175,36 @@ class Agent:
             # The receipt keeps failed turns: what was tried matters even when it was rolled back.
             self._record_turn_end(turn_usage, status="failed", error=type(e).__name__, message=str(e))
             raise
+
+    def _with_budget_note(self, user_text: str) -> str | list[BetaTextBlockParam]:
+        """Tell Claude how much budget is left, so it can plan to fit (only when there's a budget)."""
+        if self.budget is None or self.session_cost is None:
+            return user_text
+        left = max(self.budget - self.session_cost, 0)
+        note = (
+            f"<budget>This session has a ${self.budget:.2f} budget; ${left:.2f} is left. Each tool call costs "
+            "another request, so prefer fewer steps. If the task can't fit, say so before starting it.</budget>"
+        )
+        return [{"type": "text", "text": user_text}, {"type": "text", "text": note}]
+
+    def _warn_if_budget_low(self) -> None:
+        if self.budget and not self._budget_warned and self.budget_used() >= BUDGET_WARNING:
+            self._budget_warned = True
+            spent = self.session_cost or 0.0
+            self.write("\n" + paint(f"  ! {self.budget_used():.0%} of your ${self.budget:.2f} budget used", "yellow"))
+            self.write(paint(f" (${spent:.4f}). Raise it with /budget.", "yellow") + "\n")
+
+    def _budget_reached(self) -> bool:
+        """The budget is used up before the next request. Returns True to finish this turn anyway."""
+        assert self.budget is not None and self.session_cost is not None
+        spent, budget = self.session_cost, self.budget
+        if self.on_budget is not None and self.on_budget(spent, budget):
+            self._record("budget_override", spent=spent, budget=budget)
+            return True
+        self._record("budget_stop", spent=spent, budget=budget)
+        raise BudgetReached(
+            f"Stopped at your ${budget:.2f} budget (${spent:.4f} spent). Raise it with /budget and ask again."
+        )
 
     def _record_turn_end(self, turn_usage: Usage, **fields: Any) -> None:
         self._record("turn_end", usage=asdict(turn_usage), cost_usd=turn_usage.cost(self.model), **fields)

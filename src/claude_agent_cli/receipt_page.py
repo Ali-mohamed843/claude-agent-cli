@@ -16,6 +16,7 @@ from string import Template
 from typing import Any
 
 from .minimarkdown import render_markdown
+from .proof import Report
 from .recorder import display_name
 
 # ---------------------------------------------------------------------------------------------- formatting
@@ -71,6 +72,9 @@ ICONS = {
     "note": '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/>',
     "user": '<circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>',
     "lock": '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    "seal": (
+        '<path d="M12 2.5 4.5 5.5v6c0 4.6 3.2 8.3 7.5 10 4.3-1.7 7.5-5.4 7.5-10v-6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/>'
+    ),
 }
 CLAUDE_MARK = (
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.5c.5 0 .9.4 1 .9l.9 5.3 '
@@ -149,6 +153,9 @@ def group(events: list[dict[str, Any]]) -> list[Turn | Marker]:
             items.append(Marker("resume", f"Switched to {e.get('model', 'another model')}"))
         elif kind == "rename":
             items.append(Marker("rename", f"Renamed to “{e.get('name', '')}”"))
+        elif kind == "budget" and current is None:
+            amount = e.get("amount")
+            items.append(Marker("rename", f"Budget set to ${amount:.2f}" if amount else "Budget removed"))
     return items
 
 
@@ -168,6 +175,7 @@ class Summary:
     declined: int = 0
     tokens: int = 0
     cost: float | None = 0.0
+    budget: float | None = None
 
 
 def summarize(events: list[dict[str, Any]]) -> Summary:
@@ -187,6 +195,8 @@ def summarize(events: list[dict[str, Any]]) -> Summary:
             name = e.get("name")
             s.files_read += name == "read_file"
             s.searches += name == "search_files"
+        elif e["type"] == "budget":
+            s.budget = e.get("amount")
         elif e["type"] == "approval":
             s.approved += bool(e.get("approved"))
             s.declined += not e.get("approved")
@@ -355,7 +365,53 @@ def render_marker(marker: Marker) -> str:
     return f'<div class="marker {marker.kind}"><span>{escape(marker.text)}</span></div>'
 
 
-def render_receipt(s: Summary, turns: list[Turn], redacted: int | None) -> str:
+@dataclass
+class Seal:
+    """The verification result for the page, and the proof data embedded in it."""
+
+    report: Report
+    bundle: dict[str, Any]
+    filename: str  # what to pass to `receipts verify`
+
+
+def render_seal(seal: Seal | None) -> str:
+    """The stamp at the bottom of the receipt: verified, not sealed, or broken."""
+    if seal is None or seal.report.seals == 0:
+        return (
+            '<div class="seal none"><div class="seal-head">'
+            f"{icon('note')}<strong>Not sealed</strong></div>"
+            "<p>Recorded without a signing key, so there is no proof it wasn't edited.</p></div>"
+        )
+    report = seal.report
+    check = f'<p class="seal-check">Check it yourself: <code>receipts verify {escape(seal.filename)}</code></p>'
+    if report.problems:
+        return (
+            f'<div class="seal broken"><div class="seal-head">{icon("note")}<strong>Seal broken</strong></div>'
+            f"<p>{escape(report.problems[0])}</p>{check}</div>"
+        )
+    keys = " · ".join(escape(k) for k in report.keys)
+    notes = []
+    if report.redacted:
+        notes.append(f"{plural(report.redacted, 'line')} redacted here, still covered by the seal.")
+    if report.unsealed_tail:
+        notes.append(f"The last {plural(report.unsealed_tail, 'line')} came after the final seal.")
+    notes_html = "".join(f"<p>{escape(n)}</p>" for n in notes)
+    return (
+        f'<div class="seal ok"><div class="seal-head">{icon("seal")}<strong>Sealed · unedited</strong></div>'
+        f"<p>Nothing was added, removed or changed after recording.</p>"
+        f'<p class="seal-key">Key <span>{keys}</span></p>{notes_html}{check}</div>'
+    )
+
+
+def proof_script(seal: Seal | None) -> str:
+    """The proof as inert JSON data (not JavaScript): `receipts verify` reads it back out of the page."""
+    if seal is None:
+        return ""
+    data = json.dumps(seal.bundle, ensure_ascii=False).replace("</", "<\\/")  # can't end the <script> early
+    return f'<script type="application/json" id="receipt-proof">{data}</script>'
+
+
+def render_receipt(s: Summary, turns: list[Turn], redacted: int | None, seal: Seal | None = None) -> str:
     rows = [("Turns", f"{s.turns:,}" + (f" ({s.failed_turns} unanswered)" if s.failed_turns else ""))]
     if s.files_read:
         rows.append(("Files read", f"{s.files_read:,}"))
@@ -365,6 +421,9 @@ def render_receipt(s: Summary, turns: list[Turn], redacted: int | None) -> str:
         rows.append(("Commands approved", f"{s.approved:,}"))
         rows.append(("Commands declined", f"{s.declined:,}"))
     rows += [("Tokens", f"{s.tokens:,}"), ("Duration", fmt_duration(s.duration_ms))]
+    if s.budget:
+        within = s.cost is not None and s.cost <= s.budget
+        rows.append(("Budget", f"${s.budget:.2f}" + (" ✓" if within else "")))
     lines = "".join(f"<div><dt>{escape(k)}</dt><dd>{escape(v)}</dd></div>" for k, v in rows)
 
     toc = ""
@@ -382,14 +441,14 @@ def render_receipt(s: Summary, turns: list[Turn], redacted: int | None) -> str:
     return (
         f'<dl class="lines">{lines}</dl>'
         f'<div class="total"><span>Total</span><span>{escape(fmt_cost(s.cost))}</span></div>'
-        f'{toc}<p class="sealed">{icon("lock")}<span>{escape(redaction)}</span></p>'
+        f'{toc}{render_seal(seal)}<p class="sealed">{icon("lock")}<span>{escape(redaction)}</span></p>'
     )
 
 
 PAGE = Template(files(__package__).joinpath("receipt_template.html").read_text(encoding="utf-8"))
 
 
-def render(events: list[dict[str, Any]], redacted: int | None = None) -> str:
+def render(events: list[dict[str, Any]], redacted: int | None = None, seal: Seal | None = None) -> str:
     s = summarize(events)
     try:
         started = datetime.fromisoformat(s.started).astimezone().strftime("%d %b %Y · %H:%M")
@@ -408,7 +467,8 @@ def render(events: list[dict[str, Any]], redacted: int | None = None) -> str:
         agent=escape(s.agent),
         model=escape(s.model or "unknown model"),
         started=escape(started),
-        receipt=render_receipt(s, turns, redacted),
+        receipt=render_receipt(s, turns, redacted, seal),
         timeline=timeline or '<p class="empty-session">This recording has no messages yet.</p>',
         generated=escape(datetime.now().astimezone().strftime("%d %b %Y")),
+        proof=proof_script(seal),
     )

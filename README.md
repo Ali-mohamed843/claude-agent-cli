@@ -22,6 +22,10 @@ It's a tiny version of what tools like Claude Code do, written to understand how
 - **Agent receipts:** `receipts share` turns a recording into a redacted, self-contained HTML page you can send to anyone.
 - **Resume:** closed the window by mistake? `claude-agent --resume` continues the same conversation.
 - **Nothing to memorise:** type `/` for a menu of every command, `@` to pick a project file, `?` for help.
+- **Verified receipts:** every recording is hash-chained and sealed with your own key. `receipts verify` proves
+  a session wasn't edited afterwards: no deleted failed attempts, no improved answers. Redacted copies still verify.
+- **Budget guard:** `--budget 0.50` or `/budget 0.50`. Claude is told what's left, you're warned at 80%, and it
+  stops to ask before spending past the limit.
 
 ## Install
 
@@ -120,6 +124,7 @@ Keyboard shortcuts:
 | `--model MODEL` | `AGENT_MODEL` in `.env`, else `claude-opus-5-5` | Use a different model, e.g. `nvidia/nemotron-3-super-120b-a12b:free` |
 | `--effort LEVEL` | `high` | `low` / `medium` / `high` / `xhigh` / `max`: how hard Claude thinks (Claude models only) |
 | `--root PATH` | current folder | Which folder the agent can read |
+| `--budget USD` | none | Spending limit for the session, e.g. `0.50` (see [Budget guard](#budget-guard)) |
 
 ### Commands inside the chat
 
@@ -135,6 +140,7 @@ Type `/` to see these as a menu.
 | `/resume <session>` | Switch to a recorded session |
 | `/model <model>` | Switch model, e.g. when a free model is rate limited |
 | `/effort <level>` | How hard Claude thinks: `low`, `medium`, `high`, `xhigh`, `max` |
+| `/budget <amount>` | Set a spending limit for this session, e.g. `/budget 0.50`; `/budget off` removes it |
 | `/cost` | Show tokens and cost so far |
 | `/reset` | Start a new conversation (Claude forgets this one) |
 | `/clear` | Clear the screen |
@@ -149,6 +155,8 @@ Type `/` to see these as a menu.
 | `receipts share .agent-receipts\file.jsonl` | Make a page from a specific recording |
 | `receipts share -o "$HOME\Desktop\receipt.html"` | Save the page somewhere else |
 | `receipts share --no-open` | Make the page without opening the browser |
+| `receipts verify <file>` | Check that a recording (`.jsonl`) or a receipt page (`.html`) wasn't edited after sealing |
+| `receipts key` | Show your signing key's fingerprint, to publish so people know your receipts are yours |
 
 ### A typical session
 
@@ -185,6 +193,60 @@ passes raw HTML through. Redaction is best-effort, so skim the page before you s
 
 To share it, send the `.html` file (WhatsApp, email, Discord): it opens in any browser on its own.
 
+## Verified receipts
+
+Anyone can write a nice-looking page about what an AI agent did. A **verified** receipt is one you can check.
+
+Every line of a recording is chained to all the lines before it with SHA-256, and after every turn (and when the
+session ends) the agent writes a **seal**: that chain, signed with an Ed25519 key that lives only on your machine
+(`~/.claude-agent/signing-key.pem`, created the first time you record). Change one character, delete a failed
+attempt, or reorder two turns, and the seals no longer match.
+
+```bash
+receipts verify .agent-receipts/session-20261010-104300-anthropic.html
+```
+```
+  ✓ Verified: nothing was added, removed or changed after sealing.
+  └ 32 lines · 5 seals
+  └ Signed by key 1B1C 13FB EAAB 4532  ← your key
+  └ 1 line redacted in this copy: hidden, but still covered.
+  └ The sealed record: "Anthropic research" · claude-opus-5-5 · 4 turns · 4 tool calls · $0.0956
+```
+
+- **Redaction doesn't break it.** When `receipts share` hides a secret, that line goes into the page as its hash
+  only. The chain still adds up, so the seals still cover the hidden text: redacting can hide words, not edits.
+- **The page carries its own proof** as inert JSON data (still no JavaScript), and shows a "Sealed · unedited"
+  stamp. The stamp is just part of the page, though; `receipts verify` is the actual check, and it prints the
+  facts from the sealed data so you can compare them with what the page shows.
+- **Whose key?** `receipts key` shows your fingerprint. Publish it (for example in your GitHub profile) so
+  people can tell your receipts are yours.
+
+What it proves, and what it doesn't: nothing was added, removed, reordered or changed **after** sealing, by
+anyone without the key. It can't prove the key's owner didn't fabricate a whole session from scratch; a seal is
+as trustworthy as the person whose key made it. Lines written after the last seal (for example, the window was
+closed mid-turn) are reported as not covered.
+
+## Budget guard
+
+```bash
+claude-agent --budget 0.50
+```
+
+Or type `/budget 0.50` in the chat (`/budget off` removes it). Then:
+
+- **Claude knows the budget.** Each message tells it how much is left, so it can plan fewer, cheaper steps, or
+  say up front that a task won't fit.
+- **You're warned once at 80%.**
+- **It stops before going over.** The check runs before every request; at the limit you're asked whether to
+  let Claude finish the current turn. Say no and the turn stops (it's dropped from the conversation, like any
+  failed turn). Raise the limit with `/budget` and ask again.
+- **The status bar shows it** (`$0.12 / $0.50`), the budget carries over when you `--resume`, and the receipt
+  shows the budget and whether the session stayed within it.
+
+The budget covers the whole session, counted at each model's price (`cost.py`). One request can still push a
+little past the limit, since a response's size isn't known until it arrives. Free models cost nothing, so a
+budget never triggers on them; models without a known price can't be budgeted.
+
 ## Resuming a session
 
 ```bash
@@ -217,7 +279,8 @@ you ──► messages ──► Claude ──► stop_reason?
 - [`commands.py`](src/claude_agent_cli/commands.py): the list of slash commands, shared by the menu, `/help` and the chat.
 - [`streamtext.py`](src/claude_agent_cli/streamtext.py): wraps and styles Claude's text as it streams in.
 - [`style.py`](src/claude_agent_cli/style.py): colors and symbols (off automatically when output isn't a terminal, or with `NO_COLOR`).
-- [`recorder.py`](src/claude_agent_cli/recorder.py): writes the session to JSONL and finds recordings by name.
+- [`recorder.py`](src/claude_agent_cli/recorder.py): writes the session to JSONL, seals it, and finds recordings by name.
+- [`proof.py`](src/claude_agent_cli/proof.py): the hash chain, your signing key, and verification.
 - [`resume.py`](src/claude_agent_cli/resume.py): rebuilds a conversation from a recording.
 - [`receipt.py`](src/claude_agent_cli/receipt.py): the `receipts` command and redaction.
 - [`receipt_page.py`](src/claude_agent_cli/receipt_page.py) and [`receipt_template.html`](src/claude_agent_cli/receipt_template.html): the receipt page.
