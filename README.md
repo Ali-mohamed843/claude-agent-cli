@@ -33,7 +33,7 @@ Requires [uv](https://docs.astral.sh/uv/) and an API key from [console.anthropic
 (or a free [OpenRouter](https://openrouter.ai) key, see below).
 
 ```bash
-git clone https://github.com/<you>/claude-agent-cli.git
+git clone https://github.com/Ali-mohamed843/claude-agent-cli.git
 cd claude-agent-cli
 cp .env.example .env        # then put your key in .env
 uv tool install --editable . --force
